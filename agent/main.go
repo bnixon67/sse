@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/bnixon67/sloghandler"
 	"github.com/bnixon67/sse"
@@ -57,9 +58,12 @@ func main() {
 
 	// Initialize the SSE agent.
 	agent := sse.Agent{
-		ID:        "agent-1",
-		ServerURL: "http://localhost:8080",
-		Handlers:  functionRegistry,
+		ID:                "agent-1",
+		Token:             "secret-token",
+		ServerURL:         "http://localhost:8080",
+		Handlers:          functionRegistry,
+		HeartbeatInterval: 10 * time.Second,
+		RetryInterval:     5 * time.Second,
 	}
 
 	// Handle OS signals for graceful shutdown

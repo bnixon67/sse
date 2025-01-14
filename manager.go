@@ -6,55 +6,74 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
 
 // Message defines the structure for server-to-agent messages.
 type Message struct {
-	RequestID string      `json:"request_id"`
-	Command   string      `json:"function_name"`
-	Data      interface{} `json:"data"`
+	RequestID string `json:"request_id"`
+	Command   string `json:"function_name"`
+	Params    any    `json:"params"`
 }
 
-// agent holds the ResponseWriter and a channel for signaling disconnection.
+// agent holds the ResponseWriter, a channel for signaling disconnection,
+// and the timestamp of the last received heartbeat.
 type agent struct {
-	writer http.ResponseWriter
-	done   chan struct{}
+	writer        http.ResponseWriter
+	done          chan struct{}
+	lastHeartbeat time.Time
 }
 
-// AgentManager manages a collection of agents and their connections.
-type AgentManager struct {
-	mu     sync.RWMutex
-	agents map[string]*agent
+// DefaultCleanupThreshold is the default max duration before an inactive
+// agent is removed.
+const DefaultCleanupThreshold = 5 * time.Minute
+
+// Manager manages a collection of agents and their connections.
+type Manager struct {
+	mu               sync.RWMutex
+	agents           map[string]*agent
+	cleanupThreshold time.Duration // Max duration for inactive agent
+	token            string        // Token for authentication
 }
 
-// NewAgentManager initializes and returns a new AgentManager.
-func NewAgentManager() *AgentManager {
-	return &AgentManager{
-		agents: make(map[string]*agent),
+// NewManager initializes and returns a new Manager.
+func NewManager(d time.Duration, token string) *Manager {
+	if d <= 0 {
+		d = DefaultCleanupThreshold
+	}
+
+	return &Manager{
+		agents:           make(map[string]*agent),
+		cleanupThreshold: d,
+		token:            token,
 	}
 }
 
 // Register registers a new agent or updates an existing connection.
-func (m *AgentManager) Register(agentID string, w http.ResponseWriter) {
+func (m *Manager) Register(agentID string, w http.ResponseWriter) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	// Close existing connection if the agent reconnects.
-	if oldClient, exists := m.agents[agentID]; exists {
-		close(oldClient.done)
+	if oldAgent, exists := m.agents[agentID]; exists {
+		close(oldAgent.done)
 		delete(m.agents, agentID)
 		slog.Info("Agent disconnected", "agentID", agentID)
 	}
 
-	m.agents[agentID] = &agent{writer: w, done: make(chan struct{})}
+	m.agents[agentID] = &agent{
+		writer:        w,
+		done:          make(chan struct{}),
+		lastHeartbeat: time.Now(),
+	}
 
 	slog.Info("Agent connected", "agentID", agentID)
 }
 
 // Unregister removes an agent from the manager.
-func (m *AgentManager) Unregister(agentID string) {
+func (m *Manager) Unregister(agentID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -68,7 +87,7 @@ func (m *AgentManager) Unregister(agentID string) {
 }
 
 // Send attempts to send a command with data to the agent identified by agentID.
-func (m *AgentManager) Send(agentID string, command string, data interface{}) error {
+func (m *Manager) Send(agentID string, command string, params any) error {
 	const (
 		maxRetries    = 3           // Maximum number of retry attempts
 		baseBackoff   = time.Second // Base backoff duration
@@ -87,7 +106,7 @@ func (m *AgentManager) Send(agentID string, command string, data interface{}) er
 	// Retry logic with exponential backoff
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Attempt to send the command
-		if err := m.attemptSend(agentID, command, data); err == nil {
+		if err := m.attemptSend(agentID, command, params); err == nil {
 			return nil // Success
 		} else {
 			lastErr = fmt.Errorf("attempt %d failed: %w", attempt, err)
@@ -105,7 +124,7 @@ func (m *AgentManager) Send(agentID string, command string, data interface{}) er
 }
 
 // attemptSend attempts to send a command with data to the specified agent.
-func (m *AgentManager) attemptSend(agentID string, command string, data interface{}) error {
+func (m *Manager) attemptSend(agentID string, command string, params any) error {
 	// Acquire a read lock to safely access the agent map
 	m.mu.RLock()
 	agent, exists := m.agents[agentID]
@@ -119,7 +138,7 @@ func (m *AgentManager) attemptSend(agentID string, command string, data interfac
 	msg := Message{
 		RequestID: fmt.Sprintf("%d", time.Now().UnixNano()),
 		Command:   command,
-		Data:      data,
+		Params:    params,
 	}
 
 	jsonData, err := json.Marshal(msg)
@@ -153,10 +172,11 @@ func (m *AgentManager) attemptSend(agentID string, command string, data interfac
 }
 
 // Cleanup removes inactive agents from the manager.
-func (m *AgentManager) Cleanup() {
+func (m *Manager) Cleanup() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	now := time.Now()
 	for agentID, agent := range m.agents {
 		select {
 		case <-agent.done:
@@ -165,22 +185,50 @@ func (m *AgentManager) Cleanup() {
 			slog.Info("Cleaned up inactive agent",
 				"agentID", agentID)
 		default:
-			// Client is active.
+			// Remove inactive agents
+			if now.Sub(agent.lastHeartbeat) > m.cleanupThreshold {
+				close(agent.done)
+				delete(m.agents, agentID)
+				slog.Info("Agent removed due to inactivity",
+					"agentID", agentID)
+			}
 		}
 	}
 }
 
 // Count returns the number of connected agents.
-func (m *AgentManager) Count() int {
+func (m *Manager) Count() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.agents)
 }
 
+// Example token validation function
+func (m *Manager) validateToken(token string) bool {
+	return token == m.token
+}
+
 // EventsHandler creates an HTTP handler for managing a Server-Sent Events
-// (SSE) connection. It registers the client with the given AgentManager
+// (SSE) connection. It registers the client with the given Manager
 // and handles cleanup when the connection is closed.
-func (m *AgentManager) EventsHandler(w http.ResponseWriter, r *http.Request) {
+func (m *Manager) EventsHandler(w http.ResponseWriter, r *http.Request) {
+	token := r.Header.Get("Authorization")
+	if token == "" || !strings.HasPrefix(token, "Bearer ") {
+		slog.Error("missing token")
+		http.Error(w, "Unauthorized: Missing token",
+			http.StatusUnauthorized)
+		return
+	}
+
+	// Extract and validate the token
+	providedToken := strings.TrimPrefix(token, "Bearer ")
+	if !m.validateToken(providedToken) {
+		slog.Error("invalid token")
+		http.Error(w, "Unauthorized: Invalid token",
+			http.StatusUnauthorized)
+		return
+	}
+
 	agentID := r.URL.Query().Get("agentID")
 	if agentID == "" {
 		http.Error(w, "Agent ID missing", http.StatusBadRequest)
@@ -220,7 +268,7 @@ func (m *AgentManager) EventsHandler(w http.ResponseWriter, r *http.Request) {
 // GetAgentDoneChannel returns the `done` channel of the specified agent,
 // which signals when the agent's connection is closed. If the agent does
 // not exist, it returns a closed channel to prevent blocking.
-func (m *AgentManager) GetAgentDoneChannel(agentID string) <-chan struct{} {
+func (m *Manager) GetAgentDoneChannel(agentID string) <-chan struct{} {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -240,9 +288,9 @@ func closedChannel() <-chan struct{} {
 }
 
 // CleanupRoutine periodically calls the Cleanup method on the provided
-// AgentManager to remove inactive agents. It runs at the specified interval
+// Manager to remove inactive agents. It runs at the specified interval
 // until the context is canceled.
-func (m *AgentManager) CleanupRoutine(interval time.Duration, ctx context.Context) {
+func (m *Manager) CleanupRoutine(interval time.Duration, ctx context.Context) {
 	if interval <= 0 {
 		slog.Warn("Invalid cleanup interval, skipping routine")
 		return
@@ -266,27 +314,28 @@ func (m *AgentManager) CleanupRoutine(interval time.Duration, ctx context.Contex
 }
 
 // HeartbeatHandler handles periodic heartbeat signals from agents.
-func (m *AgentManager) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
+func (m *Manager) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	agentID := r.URL.Query().Get("agentID")
 	if agentID == "" {
 		http.Error(w, "Agent ID missing", http.StatusBadRequest)
 		return
 	}
 
-	// Log the received heartbeat.
-	slog.Info("Heartbeat received", "agentID", agentID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	// Confirm the agent is still connected.
-	if _, exists := m.Get(agentID); !exists {
+	if agent, exists := m.agents[agentID]; exists {
+		agent.lastHeartbeat = time.Now()
+		slog.Info("Heartbeat received", "agentID", agentID)
+		w.WriteHeader(http.StatusOK)
+	} else {
 		http.Error(w, "Agent not connected", http.StatusNotFound)
-		return
 	}
 
-	w.WriteHeader(http.StatusOK)
 }
 
-// Get retrieves an agent's data by ID.
-func (m *AgentManager) Get(agentID string) (*agent, bool) {
+// Get retrieves an agent by ID.
+func (m *Manager) Get(agentID string) (*agent, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 

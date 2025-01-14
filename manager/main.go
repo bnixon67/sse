@@ -21,7 +21,7 @@ func main() {
 	defer cancel()
 
 	// Initialize the AgentManager
-	m := sse.NewAgentManager()
+	m := sse.NewManager(time.Minute, "secret-token")
 
 	// Set up signal handling for graceful shutdown
 	handleOSSignals(cancel)
@@ -75,7 +75,7 @@ func handleOSSignals(cancelFunc context.CancelFunc) {
 }
 
 // createHandlers registers HTTP handlers for the server
-func createHandlers(m *sse.AgentManager) http.Handler {
+func createHandlers(m *sse.Manager) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/events", m.EventsHandler)
 	mux.HandleFunc("/heartbeat", m.HeartbeatHandler)
@@ -83,7 +83,7 @@ func createHandlers(m *sse.AgentManager) http.Handler {
 }
 
 // startCommandSender simulates sending periodic commands to an agent
-func startCommandSender(ctx context.Context, manager *sse.AgentManager, agentID string) {
+func startCommandSender(ctx context.Context, manager *sse.Manager, agentID string) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -107,7 +107,7 @@ func startCommandSender(ctx context.Context, manager *sse.AgentManager, agentID 
 }
 
 // sendCommand sends a command to the specified agent and logs the result
-func sendCommand(ctx context.Context, manager *sse.AgentManager, agentID, command string, data map[string]interface{}) {
+func sendCommand(ctx context.Context, manager *sse.Manager, agentID, command string, data map[string]interface{}) {
 	if err := manager.Send(agentID, command, data); err != nil {
 		slog.Error("Failed to send command", "agentID", agentID, "command", command, "error", err)
 	} else {

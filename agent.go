@@ -12,19 +12,20 @@ import (
 )
 
 // CommandHandlerMap maps command names to their handlers
-type CommandHandlerMap map[string]func(interface{})
+type CommandHandlerMap map[string]func(any)
 
 const (
 	// DefaultHeartbeatInterval defines the default interval for heartbeats.
-	DefaultHeartbeatInterval = 5 * time.Second
+	DefaultHeartbeatInterval = 1 * time.Minute
 
 	// DefaultRetryInterval defines the default interval for reconnection.
-	DefaultRetryInterval = 3 * time.Second
+	DefaultRetryInterval = 30 * time.Second
 )
 
 // Agent represents a client that connects to a server to process events.
 type Agent struct {
 	ID                string            // Unique identifier for the agent.
+	Token             string            // Bearer token for authentication.
 	ServerURL         string            // Server's base URL.
 	Handlers          CommandHandlerMap // Maps command names to handlers.
 	HeartbeatInterval time.Duration     // Heartbeat interval.
@@ -32,7 +33,7 @@ type Agent struct {
 }
 
 // ConnectAndReceiveWithReconnection connects to the server, processes events,
-// and automatically handles reconnection logic.
+// and handles reconnection logic.
 func (a *Agent) ConnectAndReceiveWithReconnection(ctx context.Context) {
 	retryInterval := a.RetryInterval
 	if retryInterval <= 0 {
@@ -59,11 +60,21 @@ func (a *Agent) ConnectAndReceiveWithReconnection(ctx context.Context) {
 // ConnectAndReceive connects to the server and processes events
 func (a *Agent) ConnectAndReceive(ctx context.Context) error {
 	url := fmt.Sprintf("%s/events?agentID=%s", a.ServerURL, a.ID)
-	resp, err := http.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+a.Token)
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to connect: server returned status %d", resp.StatusCode)
+	}
 
 	slog.Info("Connected to server", "url", url, "agentID", a.ID)
 
@@ -89,10 +100,18 @@ func (a *Agent) ConnectAndReceive(ctx context.Context) error {
 // sendHeartbeat sends a heartbeat to the server.
 func (a *Agent) sendHeartbeat() error {
 	url := fmt.Sprintf("%s/heartbeat?agentID=%s", a.ServerURL, a.ID)
-	resp, err := http.Post(url, "application/json", http.NoBody)
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+a.Token)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send heartbeat: %w", err)
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("heartbeat failed with status code: %d",
@@ -136,42 +155,37 @@ func validateMessage(msg Message) error {
 		return fmt.Errorf("missing command name")
 	}
 
-	if _, ok := msg.Data.(map[string]interface{}); !ok {
+	if _, ok := msg.Params.(map[string]any); !ok {
 		return fmt.Errorf("invalid data format")
 	}
-
-	// Add additional validation logic.
 
 	return nil
 }
 
 // handleServerMessage parses and routes incoming messages.
+// Multi-line data: is not supported.
 func (a *Agent) handleServerMessage(line string) error {
-	// Check if the line starts with "data: "
 	const prefix = "data: "
 	if !strings.HasPrefix(line, prefix) {
-		// Ignore lines that don't start with "data: "
-		return nil
+		return nil // Ignore lines that don't start with "data: "
 	}
 
-	// Extract the payload after "data: "
-	payload := line[len(prefix):]
+	payload := line[len(prefix):] // Extract the payload after "data: "
 
 	var msg Message
 	if err := json.Unmarshal([]byte(payload), &msg); err != nil {
 		return fmt.Errorf("failed to parse server message: %w", err)
 	}
 
-	// Validate the message.
 	if err := validateMessage(msg); err != nil {
 		return fmt.Errorf("invalid message: %w", err)
 	}
 
-	// Find and execute the appropriate handler.
 	if fn, exists := a.Handlers[msg.Command]; exists {
-		fn(msg.Data)
+		fn(msg.Params)
 	} else {
 		slog.Warn("Unknown command", "name", msg.Command)
 	}
+
 	return nil
 }
