@@ -30,6 +30,7 @@ type Agent struct {
 	Handlers          CommandHandlerMap // Maps command names to handlers.
 	HeartbeatInterval time.Duration     // Heartbeat interval.
 	RetryInterval     time.Duration     // Retry interval for reconnection.
+	client            *http.Client
 }
 
 // ConnectAndReceiveWithReconnection connects to the server, processes events,
@@ -57,18 +58,24 @@ func (a *Agent) ConnectAndReceiveWithReconnection(ctx context.Context) {
 	}
 }
 
+const eventsPath = "/events"
+
 // ConnectAndReceive connects to the server and processes events
 func (a *Agent) ConnectAndReceive(ctx context.Context) error {
-	url := fmt.Sprintf("%s/events?agentID=%s", a.ServerURL, a.ID)
+	url := fmt.Sprintf("%s%s?agentID=%s", a.ServerURL, eventsPath, a.ID)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+a.Token)
-	client := &http.Client{}
-	resp, err := client.Do(req)
+
+	if a.client == nil {
+		a.client = &http.Client{Timeout: 30 * time.Second}
+	}
+
+	resp, err := a.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to connect to server: %w", err)
+		return fmt.Errorf("failed to connect %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
@@ -97,9 +104,11 @@ func (a *Agent) ConnectAndReceive(ctx context.Context) error {
 	return nil
 }
 
+const heartbeatPath = "/heartbeat"
+
 // sendHeartbeat sends a heartbeat to the server.
 func (a *Agent) sendHeartbeat() error {
-	url := fmt.Sprintf("%s/heartbeat?agentID=%s", a.ServerURL, a.ID)
+	url := fmt.Sprintf("%s%s?agentID=%s", a.ServerURL, heartbeatPath, a.ID)
 	req, err := http.NewRequest("POST", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
@@ -163,7 +172,7 @@ func validateMessage(msg Message) error {
 }
 
 // handleServerMessage parses and routes incoming messages.
-// Multi-line data: is not supported.
+// Note: Multi-line `data` fields are not currently supported.
 func (a *Agent) handleServerMessage(line string) error {
 	const prefix = "data: "
 	if !strings.HasPrefix(line, prefix) {

@@ -35,9 +35,6 @@ func main() {
 	// Start the cleanup routine in a separate goroutine
 	go m.CleanupRoutine(30*time.Second, ctx)
 
-	// Start the simulated command-sending routine
-	go startCommandSender(ctx, m, "agent-1")
-
 	// Run the server in a goroutine
 	go func() {
 		slog.Info("Starting server", "address", server.Addr)
@@ -46,6 +43,11 @@ func main() {
 			cancel() // Trigger shutdown if the server crashes
 		}
 	}()
+
+	time.Sleep(5 * time.Second)
+
+	// Start the simulated command-sending routine
+	go startCommandSender(ctx, m, "agent-1")
 
 	// Wait for context cancellation (triggered by signal handling)
 	<-ctx.Done()

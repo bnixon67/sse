@@ -99,6 +99,8 @@ func (m *Manager) Send(agentID string, command string, params any) error {
 	// Ensure agent is unregistered if all attempts fail
 	defer func() {
 		if lastErr != nil {
+			slog.Warn("Unregistering after failed retries",
+				"agentID", agentID)
 			m.Unregister(agentID)
 		}
 	}()
@@ -162,7 +164,7 @@ func (m *Manager) attemptSend(agentID string, command string, params any) error 
 		if flusher, ok := agent.writer.(http.Flusher); ok {
 			flusher.Flush()
 		} else {
-			return fmt.Errorf("ResponseWriter does not support flushing for agent %s", agentID)
+			slog.Warn("Flushing not supported", "agentID", agentID)
 		}
 	}
 
@@ -277,15 +279,23 @@ func (m *Manager) GetAgentDoneChannel(agentID string) <-chan struct{} {
 	}
 
 	// Return a closed channel if agent doesn't exist to prevent blocking
-	return closedChannel()
+	return closedCh
 }
 
+var closedCh = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+/*
 // closedChannel creates and returns a closed channel of type `chan struct{}`.
 func closedChannel() <-chan struct{} {
 	ch := make(chan struct{})
 	close(ch)
 	return ch
 }
+*/
 
 // CleanupRoutine periodically calls the Cleanup method on the provided
 // Manager to remove inactive agents. It runs at the specified interval
