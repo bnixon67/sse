@@ -30,7 +30,7 @@ func updateMonitor(data interface{}) {
 
 // initializeLogging sets up the default logger with a custom handler.
 func initializeLogging() {
-	handler := sloghandler.NewLogFormatHandler(slog.LevelDebug, os.Stdout)
+	handler := sloghandler.NewLogFormatHandler(slog.LevelDebug, os.Stdout, sloghandler.DefaultTimeFormat)
 	logger := slog.New(handler)
 	slog.SetDefault(logger)
 }
