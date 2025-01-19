@@ -26,32 +26,12 @@ const DefaultHeartbeatInterval = 1 * time.Minute
 // before attempting to reconnect after a connection failure.
 const DefaultRetryInterval = 30 * time.Second
 
-// Agent represents a client that connects to a server using Server-Sent
-// Events (SSE). It provides methods to manage the connection and send
-// heartbeat signals.
-type Agent interface {
-	// ConnectAndReceiveRetry establishes a persistent connection to
-	// the server, continuously listening for messages. If the connection
-	// is lost, it automatically retries until the provided context
-	// is canceled.
-	ConnectAndReceiveRetry(ctx context.Context)
-
-	// ConnectAndReceive connects to the server and listens for incoming
-	// events. It processes messages until the connection is lost or the
-	// provided context is canceled. Returns an error if the connection
-	// cannot be established.
-	ConnectAndReceive(ctx context.Context) error
-
-	// SendHeartbeat transmits a heartbeat signal to the server to indicate
-	// an active connection. Returns an error if the request fails.
-	SendHeartbeat() error
-}
-
 // AgentOption represents a functional option for configuring an Agent instance.
-type AgentOption func(*agent)
+type AgentOption func(*Agent)
 
-// agent is a client that connects to a server to receive and process events.
-type agent struct {
+// Agent is a client that connects to a server using Server-Sent Events
+// (SSE) to receive and process events.
+type Agent struct {
 	ID                string            // Unique identifier for the agent.
 	Token             string            // Bearer token for authentication.
 	ServerURL         string            // Base URL of the SSE server.
@@ -59,6 +39,10 @@ type agent struct {
 	HeartbeatInterval time.Duration     // Interval for hearbeat signals.
 	RetryInterval     time.Duration     // Interval for reconnect attempts.
 	Client            *http.Client      // HTTP client for requests.
+
+	// Function hooks for customization
+	ConnectAndReceiveFn func(ctx context.Context) error
+	SendHeartbeatFn     func() error
 }
 
 // NewAgent creates a new Agent instance with the specified ID, token, and
@@ -71,12 +55,12 @@ type agent struct {
 // If no functional options are provided, the agent is initialized with default
 // settings, including [DefaultHeartbeatInterval], [DefaultRetryInterval],
 // and a default HTTP client.
-func NewAgent(id, token, serverURL string, handlers CmdHandlerFuncMap, opts ...AgentOption) Agent {
+func NewAgent(id, token, serverURL string, handlers CmdHandlerFuncMap, opts ...AgentOption) *Agent {
 	if handlers == nil {
 		handlers = make(CmdHandlerFuncMap)
 	}
 
-	a := &agent{
+	a := &Agent{
 		ID:                id,
 		Token:             token,
 		ServerURL:         serverURL,
@@ -86,6 +70,10 @@ func NewAgent(id, token, serverURL string, handlers CmdHandlerFuncMap, opts ...A
 		Client:            &http.Client{},
 		// Don't set Client Timeout connection should stay open.
 	}
+
+	// Set default function implementations
+	a.ConnectAndReceiveFn = a.ConnectAndReceive
+	a.SendHeartbeatFn = a.SendHeartbeat
 
 	for _, opt := range opts {
 		opt(a)
@@ -99,7 +87,7 @@ func NewAgent(id, token, serverURL string, handlers CmdHandlerFuncMap, opts ...A
 // If the provided interval is zero or negative, the existing heartbeat
 // interval remains unchanged.
 func WithHeartbeatInterval(interval time.Duration) AgentOption {
-	return func(a *agent) {
+	return func(a *Agent) {
 		if interval <= 0 {
 			return
 		}
@@ -112,7 +100,7 @@ func WithHeartbeatInterval(interval time.Duration) AgentOption {
 // If the provided interval is zero or negative, the existing retry interval
 // remains unchanged.
 func WithRetryInterval(interval time.Duration) AgentOption {
-	return func(a *agent) {
+	return func(a *Agent) {
 		if interval <= 0 {
 			return
 		}
@@ -124,26 +112,45 @@ func WithRetryInterval(interval time.Duration) AgentOption {
 //
 // If nil is provided, the existing client remains unchanged.
 func WithClient(client *http.Client) AgentOption {
-	return func(a *agent) {
+	return func(a *Agent) {
 		if client == nil {
 			return
 		}
-
 		a.Client = client
+	}
+}
+
+// WithCustomConnectAndReceive allows a custom [ConnectAndReceive] function
+func WithCustomConnectAndReceive(fn func(ctx context.Context) error) AgentOption {
+	return func(a *Agent) {
+		if fn == nil {
+			return
+		}
+		a.ConnectAndReceiveFn = fn
+	}
+}
+
+// WithCustomSendHeartbeat allows a custom [SendHeartbeat] function
+func WithCustomSendHeartbeat(fn func() error) AgentOption {
+	return func(a *Agent) {
+		if fn == nil {
+			return
+		}
+		a.SendHeartbeatFn = fn
 	}
 }
 
 // ConnectAndReceiveRetry establishes a connection to the server and listens
 // for events. If the connection is lost, it automatically attempts to
 // reconnect. The function runs until the provided context is canceled.
-func (a *agent) ConnectAndReceiveRetry(ctx context.Context) {
+func (a *Agent) ConnectAndReceiveRetry(ctx context.Context) {
 	retryInterval := a.RetryInterval
 	if retryInterval <= 0 {
 		retryInterval = DefaultRetryInterval
 	}
 
 	for {
-		if err := a.ConnectAndReceive(ctx); err != nil {
+		if err := a.ConnectAndReceiveFn(ctx); err != nil {
 			slog.Error("Connection error",
 				"agentID", a.ID, "error", err)
 		}
@@ -181,7 +188,7 @@ func buildURL(baseURL, path, agentID string) (string, error) {
 // incoming events. It listens for events until the connection is lost
 // or the provided context is canceled. Returns an error if the connection
 // cannot be established.
-func (a *agent) ConnectAndReceive(ctx context.Context) error {
+func (a *Agent) ConnectAndReceive(ctx context.Context) error {
 	u, err := buildURL(a.ServerURL, "/events", a.ID)
 	if err != nil {
 		return fmt.Errorf("failed to create URL: %w", err)
@@ -227,7 +234,7 @@ func (a *agent) ConnectAndReceive(ctx context.Context) error {
 
 // SendHeartbeat notifies the server that the agent is active. Returns an
 // error if the request fails.
-func (a *agent) SendHeartbeat() error {
+func (a *Agent) SendHeartbeat() error {
 	u, err := buildURL(a.ServerURL, "/heartbeat", a.ID)
 	if err != nil {
 		return fmt.Errorf("failed to create URL: %w", err)
@@ -255,10 +262,19 @@ func (a *agent) SendHeartbeat() error {
 
 // startHeartbeat periodically sends heartbeat signals to the server at the
 // configured interval until the provided context is canceled.
-func (a *agent) startHeartbeat(ctx context.Context) {
+func (a *Agent) startHeartbeat(ctx context.Context) {
 	slog.Info("Heartbeat started", "agentID", a.ID)
 
-	ticker := time.NewTicker(a.HeartbeatInterval)
+	heartbeatInterval := a.HeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = DefaultHeartbeatInterval
+	}
+
+	if a.SendHeartbeatFn == nil {
+		a.SendHeartbeatFn = a.SendHeartbeat
+	}
+
+	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
 	for {
@@ -268,7 +284,7 @@ func (a *agent) startHeartbeat(ctx context.Context) {
 			return
 		case <-ticker.C:
 			slog.Debug("Sending heartbeat", "agentID", a.ID)
-			if err := a.SendHeartbeat(); err != nil {
+			if err := a.SendHeartbeatFn(); err != nil {
 				slog.Error("Failed to send heartbeat",
 					"agentID", a.ID, "error", err)
 			}
@@ -294,7 +310,7 @@ func validateMessage(m Message) error {
 // handler.
 //
 // Note: Multi-line `data` fields are not currently supported.
-func (a *agent) processServerEvent(eventLine string) error {
+func (a *Agent) processServerEvent(eventLine string) error {
 	const dataPrefix = "data: "
 	if !strings.HasPrefix(eventLine, dataPrefix) {
 		return nil // Ignore lines that don't start with "data: "
