@@ -45,6 +45,13 @@ type Agent struct {
 	SendHeartbeatFn     func() error
 }
 
+var DefaultHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		IdleConnTimeout: 90 * time.Second,
+	},
+	// Don't set Client Timeout connection should stay open.
+}
+
 // NewAgent creates a new Agent instance with the specified ID, token, and
 // server URL. It uses the provided command handler map to dispatch commands
 // to their respective functions. Additional configuration options can be
@@ -67,8 +74,7 @@ func NewAgent(id, token, serverURL string, handlers CmdHandlerFuncMap, opts ...A
 		Handlers:          handlers,
 		HeartbeatInterval: DefaultHeartbeatInterval,
 		RetryInterval:     DefaultRetryInterval,
-		Client:            &http.Client{},
-		// Don't set Client Timeout connection should stay open.
+		Client:            DefaultHTTPClient,
 	}
 
 	// Set default function implementations
@@ -184,33 +190,51 @@ func buildURL(baseURL, path, agentID string) (string, error) {
 	return u.String(), nil
 }
 
-// ConnectAndReceive establishes a connection to the server and processes
-// incoming events. It listens for events until the connection is lost
-// or the provided context is canceled. Returns an error if the connection
-// cannot be established.
-func (a *Agent) ConnectAndReceive(ctx context.Context) error {
-	u, err := buildURL(a.ServerURL, "/events", a.ID)
+// sendRequest sends an HTTP request to the given endpoint using the agent's
+// configuration. It sets the Authorization header and returns the HTTP
+// response.
+//
+// The caller is responsible for closing the response body.
+//
+// An error is returned if the request fails or the server returns a non-200
+// status.
+func (a *Agent) sendRequest(ctx context.Context, method, endpoint string) (*http.Response, error) {
+	u, err := buildURL(a.ServerURL, endpoint, a.ID)
 	if err != nil {
-		return fmt.Errorf("failed to create URL: %w", err)
+		return nil, fmt.Errorf("failed to create URL: %w", err)
 	}
 
-	req, err := http.NewRequest("GET", u, nil)
+	req, err := http.NewRequestWithContext(ctx, method, u, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
 	resp, err := a.Client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to send %s: %w", u, err)
+		return nil, fmt.Errorf("request to %s failed: %w", u, err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("request to %s failed with status code: %d", u, resp.StatusCode)
+	}
+
+	return resp, nil
+}
+
+// ConnectAndReceive establishes a connection to the server and processes
+// incoming events. It listens for events until the connection is lost
+// or the provided context is canceled. Returns an error if the connection
+// cannot be established.
+func (a *Agent) ConnectAndReceive(ctx context.Context) error {
+	resp, err := a.sendRequest(ctx, "GET", "/events")
+	if err != nil {
+		return fmt.Errorf("failed to connect to server: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to send, status %d", resp.StatusCode)
-	}
-
-	slog.Info("Connected to server", "url", u, "agentID", a.ID)
+	slog.Info("Connected to server", "agentID", a.ID)
 
 	go a.startHeartbeat(ctx)
 
@@ -235,27 +259,11 @@ func (a *Agent) ConnectAndReceive(ctx context.Context) error {
 // SendHeartbeat notifies the server that the agent is active. Returns an
 // error if the request fails.
 func (a *Agent) SendHeartbeat() error {
-	u, err := buildURL(a.ServerURL, "/heartbeat", a.ID)
+	resp, err := a.sendRequest(context.Background(), "POST", "/heartbeat")
 	if err != nil {
-		return fmt.Errorf("failed to create URL: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", u, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+a.Token)
-
-	resp, err := a.Client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to send heartbeat: %w", err)
+		return fmt.Errorf("heartbeat failed: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("heartbeat failed with status code: %d",
-			resp.StatusCode)
-	}
 
 	return nil
 }
@@ -271,7 +279,9 @@ func (a *Agent) startHeartbeat(ctx context.Context) {
 	}
 
 	if a.SendHeartbeatFn == nil {
-		a.SendHeartbeatFn = a.SendHeartbeat
+		slog.Error("SendHeartbeatFn is nil, skipping heartbeat",
+			"agentID", a.ID)
+		return
 	}
 
 	ticker := time.NewTicker(heartbeatInterval)
@@ -300,7 +310,7 @@ func validateMessage(m Message) error {
 	}
 
 	if _, ok := m.Params.(map[string]any); !ok {
-		return fmt.Errorf("invalid parameters format")
+		return fmt.Errorf("invalid parameters format: expected map[string]any, got %T", m.Params)
 	}
 
 	return nil

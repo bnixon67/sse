@@ -41,7 +41,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:          "Handlers",
@@ -53,7 +53,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  testHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:      "Custom heartbeat interval",
@@ -67,7 +67,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: 42 * time.Second,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:      "Zero heartbeat interval",
@@ -81,7 +81,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:      "Negative heartbeat interval",
@@ -95,7 +95,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:      "Custom retry interval",
@@ -109,7 +109,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     13 * time.Second,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:      "Zero retry interval",
@@ -123,7 +123,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:      "Negative retry interval",
@@ -137,7 +137,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:      "Custom HTTP client",
@@ -167,7 +167,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:      "Nil Custom ConnectAndReceive",
@@ -181,7 +181,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:      "Custom ConnectAndReceive",
@@ -198,7 +198,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:      "Nil Custom SendHeartbeat",
@@ -212,7 +212,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 		{
 			name:      "Custom SendHeartbeat",
@@ -229,7 +229,7 @@ func TestNewAgent(t *testing.T) {
 			wantHandlers:  defaultHandlers,
 			wantHeartbeat: DefaultHeartbeatInterval,
 			wantRetry:     DefaultRetryInterval,
-			wantClient:    &http.Client{},
+			wantClient:    DefaultHTTPClient,
 		},
 	}
 
@@ -677,6 +677,118 @@ func TestProcessServerEvent(t *testing.T) {
 
 			if !reflect.DeepEqual(gotParams, tc.wantParams) {
 				t.Errorf("gotParams = %v, want %v", gotParams, tc.wantParams)
+			}
+		})
+	}
+}
+
+// mockHTTPTransport implements http.RoundTripper for custom response handling.
+type mockHTTPTransport struct {
+	doFunc func(req *http.Request) (*http.Response, error)
+}
+
+// RoundTrip executes the mocked HTTP request.
+func (m *mockHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return m.doFunc(req)
+}
+
+func TestSendRequest(t *testing.T) {
+	tests := []struct {
+		name         string
+		method       string
+		endpoint     string
+		statusCode   int
+		mockError    error
+		expectErr    bool
+		expectStatus int
+	}{
+		{
+			name:         "Successful GET request",
+			method:       "GET",
+			endpoint:     "/events",
+			statusCode:   http.StatusOK,
+			expectErr:    false,
+			expectStatus: http.StatusOK,
+		},
+		{
+			name:         "Successful POST request",
+			method:       "POST",
+			endpoint:     "/heartbeat",
+			statusCode:   http.StatusOK,
+			expectErr:    false,
+			expectStatus: http.StatusOK,
+		},
+		{
+			name:         "Server returns 500",
+			method:       "GET",
+			endpoint:     "/fail",
+			statusCode:   http.StatusInternalServerError,
+			expectErr:    true,
+			expectStatus: http.StatusInternalServerError,
+		},
+		{
+			name:      "Network failure",
+			method:    "GET",
+			endpoint:  "/network-error",
+			mockError: errors.New("network error"),
+			expectErr: true,
+		},
+		{
+			name:       "Invalid method",
+			method:     "INVALID",
+			endpoint:   "/invalid",
+			statusCode: http.StatusBadRequest,
+			expectErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Mock HTTP server to return predefined responses.
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != tt.endpoint {
+					http.NotFound(w, r)
+					return
+				}
+				w.WriteHeader(tt.statusCode)
+			}))
+			defer server.Close()
+
+			// Create agent with mock client
+			agent := &Agent{
+				ID:        "test-agent",
+				Token:     "test-token",
+				ServerURL: server.URL,
+			}
+
+			// Use a mock client if needed
+			if tt.mockError != nil {
+				agent.Client = &http.Client{
+					Transport: &mockHTTPTransport{
+						doFunc: func(req *http.Request) (*http.Response, error) {
+							return nil, tt.mockError
+						},
+					},
+				}
+			} else {
+				agent.Client = server.Client()
+			}
+
+			// Call sendRequest
+			resp, err := agent.sendRequest(context.Background(), tt.method, tt.endpoint)
+
+			// Validate results
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+				if resp.StatusCode != tt.expectStatus {
+					t.Errorf("Expected status %d, got %d", tt.expectStatus, resp.StatusCode)
+				}
 			}
 		})
 	}
