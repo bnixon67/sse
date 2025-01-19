@@ -7,35 +7,127 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// CommandHandlerMap maps command names to their handlers
-type CommandHandlerMap map[string]func(any)
+// CommandHandlerFunc defines a func type that processes a command's payload.
+type CommandHandlerFunc func(any)
 
-const (
-	// DefaultHeartbeatInterval defines the default interval for heartbeats.
-	DefaultHeartbeatInterval = 1 * time.Minute
+// CmdHandlerFuncMap maps command names to respective handler functions.
+type CmdHandlerFuncMap map[string]CommandHandlerFunc
 
-	// DefaultRetryInterval defines the default interval for reconnection.
-	DefaultRetryInterval = 30 * time.Second
-)
+// DefaultHeartbeatInterval is the standard time interval for an agent
+// to send heartbeat signals to the server, indicating it is still active.
+const DefaultHeartbeatInterval = 1 * time.Minute
 
-// Agent represents a client that connects to a server to process events.
-type Agent struct {
-	ID                string            // Unique identifier for the agent.
-	Token             string            // Bearer token for authentication.
-	ServerURL         string            // Server's base URL.
-	Handlers          CommandHandlerMap // Maps command names to handlers.
-	HeartbeatInterval time.Duration     // Heartbeat interval.
-	RetryInterval     time.Duration     // Retry interval for reconnection.
-	client            *http.Client
+// DefaultRetryInterval defines the default duration an agent waits
+// before attempting to reconnect after a connection failure.
+const DefaultRetryInterval = 30 * time.Second
+
+// Agent represents a client that connects to a server using Server-Sent
+// Events (SSE). It provides methods to manage the connection and send
+// heartbeat signals.
+type Agent interface {
+	// ConnectAndReceiveRetry establishes a persistent connection to
+	// the server, continuously listening for messages. If the connection
+	// is lost, it automatically retries until the provided context
+	// is canceled.
+	ConnectAndReceiveRetry(ctx context.Context)
+
+	// ConnectAndReceive connects to the server and listens for incoming
+	// events. It processes messages until the connection is lost or the
+	// provided context is canceled. Returns an error if the connection
+	// cannot be established.
+	ConnectAndReceive(ctx context.Context) error
+
+	// SendHeartbeat transmits a heartbeat signal to the server to indicate
+	// an active connection. Returns an error if the request fails.
+	SendHeartbeat() error
 }
 
-// ConnectAndReceiveWithReconnection connects to the server, processes events,
-// and handles reconnection logic.
-func (a *Agent) ConnectAndReceiveWithReconnection(ctx context.Context) {
+// AgentOption represents a functional option for configuring an Agent instance.
+type AgentOption func(*agent)
+
+// agent is a client that connects to a server to receive and process events.
+type agent struct {
+	ID                string            // Unique identifier for the agent.
+	Token             string            // Bearer token for authentication.
+	ServerURL         string            // Base URL of the SSE server.
+	Handlers          CmdHandlerFuncMap // Maps command names to handlers.
+	HeartbeatInterval time.Duration     // Interval for hearbeat signals.
+	RetryInterval     time.Duration     // Interval for reconnect attempts.
+	Client            *http.Client      // HTTP client for requests.
+}
+
+// NewAgent creates a new Agent instance with the specified ID, token,
+// and server URL. A map of command handlers must be provided to define
+// how different commands are processed. Additional configuration options
+// can be applied using functional options (AgentOption).
+//
+// If nil is provided for handlers, an empty CommandHandlerMap is used.
+// If no functional options are provided, the agent is initialized with
+// default settings for heartbeat and retry intervals.
+func NewAgent(id, token, serverURL string, handlers CmdHandlerFuncMap, opts ...AgentOption) Agent {
+	if handlers == nil {
+		handlers = make(CmdHandlerFuncMap)
+	}
+
+	a := &agent{
+		ID:                id,
+		Token:             token,
+		ServerURL:         serverURL,
+		Handlers:          handlers,
+		HeartbeatInterval: DefaultHeartbeatInterval,
+		RetryInterval:     DefaultRetryInterval,
+		Client:            &http.Client{},
+		// Don't set Client Timeout connectioni should stay open.
+	}
+
+	for _, opt := range opts {
+		opt(a)
+	}
+
+	return a
+}
+
+// WithHeartbeatInterval sets the heartbeat interval for an Agent.
+// If the provided interval is zero or negative, the default heartbeat
+// interval (DefaultHeartbeatInterval) is used.
+func WithHeartbeatInterval(interval time.Duration) AgentOption {
+	return func(a *agent) {
+		if interval > 0 {
+			a.HeartbeatInterval = interval
+		}
+	}
+}
+
+// WithRetryInterval sets the reconnection retry interval for an Agent.
+// If the provided interval is zero or negative, the default retry
+// interval (DefaultRetryInterval) is used.
+func WithRetryInterval(interval time.Duration) AgentOption {
+	return func(a *agent) {
+		if interval > 0 {
+			a.RetryInterval = interval
+		}
+	}
+}
+
+// WithClient sets the HTTP client for an Agent.
+// If nil is provided, a default HTTP client with a standard timeout is used.
+func WithClient(client *http.Client) AgentOption {
+	return func(a *agent) {
+		if client != nil {
+			a.Client = client
+		}
+	}
+}
+
+// ConnectAndReceiveRetry establishes a connection to the server and listens
+// for events. If the connection is lost, it automatically attempts to
+// reconnect. The function runs until the provided context is canceled.
+func (a *agent) ConnectAndReceiveRetry(ctx context.Context) {
 	retryInterval := a.RetryInterval
 	if retryInterval <= 0 {
 		retryInterval = DefaultRetryInterval
@@ -58,32 +150,51 @@ func (a *Agent) ConnectAndReceiveWithReconnection(ctx context.Context) {
 	}
 }
 
-const eventsPath = "/events"
+// buildURL constructs the URL with the agent ID as a query parameter.
+func buildURL(baseURL, path, agentID string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid server URL: %w", err)
+	}
+	u.Path, err = url.JoinPath(u.Path, path)
+	if err != nil {
+		return "", fmt.Errorf("failed to join path: %w", err)
+	}
 
-// ConnectAndReceive connects to the server and processes events
-func (a *Agent) ConnectAndReceive(ctx context.Context) error {
-	url := fmt.Sprintf("%s%s?agentID=%s", a.ServerURL, eventsPath, a.ID)
-	req, err := http.NewRequest("GET", url, nil)
+	query := u.Query()
+	query.Set("agentID", agentID)
+	u.RawQuery = query.Encode()
+
+	return u.String(), nil
+}
+
+// ConnectAndReceive establishes a connection to the server and processes
+// incoming events. It listens for events until the connection is lost
+// or the provided context is canceled. Returns an error if the connection
+// cannot be established.
+func (a *agent) ConnectAndReceive(ctx context.Context) error {
+	u, err := buildURL(a.ServerURL, "/events", a.ID)
+	if err != nil {
+		return fmt.Errorf("failed to create URL: %w", err)
+	}
+
+	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	if a.client == nil {
-		a.client = &http.Client{Timeout: 30 * time.Second}
-	}
-
-	resp, err := a.client.Do(req)
+	resp, err := a.Client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to connect %s: %w", url, err)
+		return fmt.Errorf("failed to send %s: %w", u, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to connect: server returned status %d", resp.StatusCode)
+		return fmt.Errorf("failed to send, status %d", resp.StatusCode)
 	}
 
-	slog.Info("Connected to server", "url", url, "agentID", a.ID)
+	slog.Info("Connected to server", "url", u, "agentID", a.ID)
 
 	go a.startHeartbeat(ctx)
 
@@ -91,32 +202,35 @@ func (a *Agent) ConnectAndReceive(ctx context.Context) error {
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if err := a.handleServerMessage(line); err != nil {
-			slog.Error("Failed to handle server message",
+		if err := a.processServerEvent(line); err != nil {
+			slog.Error("Failed to process server event",
 				"error", err, "line", line)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading server response: %w", err)
+		return fmt.Errorf("error reading from server: %w", err)
 	}
 
 	slog.Info("Disconnected from server", "agentID", a.ID)
+
 	return nil
 }
 
-const heartbeatPath = "/heartbeat"
+// SendHeartbeat notifies the server that the agent is active.
+// Returns an error if the request fails.
+func (a *agent) SendHeartbeat() error {
+	u, err := buildURL(a.ServerURL, "/heartbeat", a.ID)
+	if err != nil {
+		return fmt.Errorf("failed to create URL: %w", err)
+	}
 
-// sendHeartbeat sends a heartbeat to the server.
-func (a *Agent) sendHeartbeat() error {
-	url := fmt.Sprintf("%s%s?agentID=%s", a.ServerURL, heartbeatPath, a.ID)
-	req, err := http.NewRequest("POST", url, nil)
+	req, err := http.NewRequest("POST", u, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := a.Client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send heartbeat: %w", err)
 	}
@@ -130,17 +244,12 @@ func (a *Agent) sendHeartbeat() error {
 	return nil
 }
 
-// startHeartbeat periodically sends heartbeats to the server.
-// Stops sending heartbeats when the context is canceled.
-func (a *Agent) startHeartbeat(ctx context.Context) {
+// startHeartbeat periodically sends heartbeat signals to the server at the
+// configured interval until the provided context is canceled.
+func (a *agent) startHeartbeat(ctx context.Context) {
 	slog.Info("Heartbeat started", "agentID", a.ID)
 
-	interval := a.HeartbeatInterval
-	if interval <= 0 {
-		interval = DefaultHeartbeatInterval
-	}
-
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(a.HeartbeatInterval)
 	defer ticker.Stop()
 
 	for {
@@ -150,7 +259,7 @@ func (a *Agent) startHeartbeat(ctx context.Context) {
 			return
 		case <-ticker.C:
 			slog.Debug("Sending heartbeat", "agentID", a.ID)
-			if err := a.sendHeartbeat(); err != nil {
+			if err := a.SendHeartbeat(); err != nil {
 				slog.Error("Failed to send heartbeat",
 					"agentID", a.ID, "error", err)
 			}
@@ -158,31 +267,36 @@ func (a *Agent) startHeartbeat(ctx context.Context) {
 	}
 }
 
-// validateMessage validates the structure of an API message.
-func validateMessage(msg Message) error {
-	if msg.Command == "" {
+// validateMessage checks whether a Message is valid.
+// It returns an error if the message is missing a command
+// or has an invalid parameter format.
+func validateMessage(m Message) error {
+	if m.Command == "" {
 		return fmt.Errorf("missing command name")
 	}
 
-	if _, ok := msg.Params.(map[string]any); !ok {
-		return fmt.Errorf("invalid data format")
+	if _, ok := m.Params.(map[string]any); !ok {
+		return fmt.Errorf("invalid parameters format")
 	}
 
 	return nil
 }
 
-// handleServerMessage parses and routes incoming messages.
+// processServerEvent routes an incoming server event to the appropriate
+// handler.
+//
 // Note: Multi-line `data` fields are not currently supported.
-func (a *Agent) handleServerMessage(line string) error {
-	const prefix = "data: "
-	if !strings.HasPrefix(line, prefix) {
+func (a *agent) processServerEvent(eventLine string) error {
+	const dataPrefix = "data: "
+	if !strings.HasPrefix(eventLine, dataPrefix) {
 		return nil // Ignore lines that don't start with "data: "
 	}
 
-	payload := line[len(prefix):] // Extract the payload after "data: "
+	// Extract the eventData after "data: "
+	eventData := eventLine[len(dataPrefix):]
 
 	var msg Message
-	if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+	if err := json.Unmarshal([]byte(eventData), &msg); err != nil {
 		return fmt.Errorf("failed to parse server message: %w", err)
 	}
 

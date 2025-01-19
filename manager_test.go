@@ -109,7 +109,7 @@ func TestAgentManager_Cleanup(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		close(manager.agents["inactive-agent"].done)
+		close(manager.sessions["inactive-agent"].done)
 	}()
 
 	wg.Wait()

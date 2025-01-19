@@ -22,7 +22,7 @@ func TestAgent_ConnectAndReceive(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 
 		for i := 0; i < wantExecutions; i++ {
-			_, _ = w.Write([]byte("data: {\"function_name\":\"TestCommand\",\"params\":{\"key\":\"value\"}}\n\n"))
+			_, _ = w.Write([]byte("data: {\"command\":\"TestCommand\",\"params\":{\"key\":\"value\"}}\n\n"))
 			flusher.Flush()
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -30,11 +30,8 @@ func TestAgent_ConnectAndReceive(t *testing.T) {
 	defer server.Close()
 
 	gotExecutions := 0
-	agent := &Agent{
-		ID:        "test-agent",
-		Token:     "token",
-		ServerURL: server.URL,
-		Handlers: CommandHandlerMap{
+	agent := NewAgent("test-agent", "token", server.URL,
+		CmdHandlerFuncMap{
 			"TestCommand": func(params any) {
 				gotExecutions = gotExecutions + 1
 
@@ -57,7 +54,7 @@ func TestAgent_ConnectAndReceive(t *testing.T) {
 				}
 			},
 		},
-	}
+	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()

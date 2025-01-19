@@ -13,7 +13,7 @@ import (
 )
 
 // Function registry for handling commands.
-var functionRegistry = sse.CommandHandlerMap{
+var functionRegistry = sse.CmdHandlerFuncMap{
 	"NewMonitor":    newMonitor,
 	"UpdateMonitor": updateMonitor,
 }
@@ -57,21 +57,19 @@ func main() {
 	defer cancel()
 
 	// Initialize the SSE agent.
-	agent := sse.Agent{
-		ID:                "agent-1",
-		Token:             "secret-token",
-		ServerURL:         "http://localhost:8080",
-		Handlers:          functionRegistry,
-		HeartbeatInterval: 10 * time.Second,
-		RetryInterval:     5 * time.Second,
-	}
+	agent := sse.NewAgent(
+		"agent-1", "secret-token", "http://localhost:8080",
+		functionRegistry,
+		sse.WithHeartbeatInterval(10*time.Second),
+		sse.WithRetryInterval(5*time.Second),
+	)
 
 	// Handle OS signals for graceful shutdown
 	handleOSSignals(cancel)
 
 	// Start the agent's main loop in a goroutine
 	go func() {
-		agent.ConnectAndReceiveWithReconnection(ctx)
+		agent.ConnectAndReceiveRetry(ctx)
 	}()
 
 	// Wait for context cancellation (triggered by signal handling)

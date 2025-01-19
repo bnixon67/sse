@@ -33,7 +33,7 @@ func main() {
 	}
 
 	// Start the cleanup routine in a separate goroutine
-	go m.CleanupRoutine(30*time.Second, ctx)
+	go m.CleanupRoutine(ctx, 30*time.Second)
 
 	// Run the server in a goroutine
 	go func() {

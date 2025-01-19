@@ -11,59 +11,68 @@ import (
 	"time"
 )
 
-// Message defines the structure for server-to-agent messages.
+// Message represents a command sent from the server to an agent.
 type Message struct {
-	RequestID string `json:"request_id"`
-	Command   string `json:"function_name"`
-	Params    any    `json:"params"`
+	RequestID string // Unique identifier for the request.
+	Command   string // Name of the command to execute.
+	Params    any    // Optional parameters for the command.
 }
 
-// agent holds the ResponseWriter, a channel for signaling disconnection,
-// and the timestamp of the last received heartbeat.
-type agent struct {
+// session maintains an agent's connection details.
+type session struct {
 	writer        http.ResponseWriter
 	done          chan struct{}
 	lastHeartbeat time.Time
 }
 
-// DefaultCleanupThreshold is the default max duration before an inactive
-// agent is removed.
+// DefaultCleanupThreshold specifies the maximum duration an inactive session
+// is retained before being removed.
 const DefaultCleanupThreshold = 5 * time.Minute
 
-// Manager manages a collection of agents and their connections.
+// Manager handles the lifecycle of agent sessions.
 type Manager struct {
-	mu               sync.RWMutex
-	agents           map[string]*agent
-	cleanupThreshold time.Duration // Max duration for inactive agent
-	token            string        // Token for authentication
+	// Ensures thread-safe access to sessions.
+	mu sync.RWMutex
+
+	// Active agent sessions indexed by agent ID.
+	sessions map[string]*session
+
+	// Duration before an inactive session is removed.
+	cleanupThreshold time.Duration
+
+	// Authentication token for agent validation.
+	token string
 }
 
-// NewManager initializes and returns a new Manager.
+// NewManager creates a new Manager instance with the specified cleanup
+// threshold and authentication token.
 func NewManager(d time.Duration, token string) *Manager {
 	if d <= 0 {
 		d = DefaultCleanupThreshold
 	}
 
 	return &Manager{
-		agents:           make(map[string]*agent),
+		sessions:         make(map[string]*session),
 		cleanupThreshold: d,
 		token:            token,
 	}
 }
 
-// Register registers a new agent or updates an existing connection.
+// Register creates a new session for the specified agent ID or updates an
+// existing one. If the agent is already connected, the previous session
+// is closed and replaced.
 func (m *Manager) Register(agentID string, w http.ResponseWriter) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Close existing connection if the agent reconnects.
-	if oldAgent, exists := m.agents[agentID]; exists {
+	// Close existing connection if the session reconnects.
+	if oldAgent, exists := m.sessions[agentID]; exists {
 		close(oldAgent.done)
-		delete(m.agents, agentID)
+		delete(m.sessions, agentID)
 		slog.Info("Agent disconnected", "agentID", agentID)
 	}
 
-	m.agents[agentID] = &agent{
+	m.sessions[agentID] = &session{
 		writer:        w,
 		done:          make(chan struct{}),
 		lastHeartbeat: time.Now(),
@@ -72,21 +81,23 @@ func (m *Manager) Register(agentID string, w http.ResponseWriter) {
 	slog.Info("Agent connected", "agentID", agentID)
 }
 
-// Unregister removes an agent from the manager.
+// Unregister removes the session for the specified agent ID.
+// If the agent is connected, its session is closed and deleted.
 func (m *Manager) Unregister(agentID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if agent, exists := m.agents[agentID]; exists {
-		close(agent.done)
-		delete(m.agents, agentID)
+	if session, exists := m.sessions[agentID]; exists {
+		close(session.done)
+		delete(m.sessions, agentID)
 		slog.Info("Agent disconnected", "agentID", agentID)
 	} else {
 		slog.Warn("Agent does not exist", "agentID", agentID)
 	}
 }
 
-// Send attempts to send a command with data to the agent identified by agentID.
+// Send delivers a command with parameters to the specified agent. Returns an
+// error if the agent is not connected or if the message cannot be sent.
 func (m *Manager) Send(agentID string, command string, params any) error {
 	const (
 		maxRetries    = 3           // Maximum number of retry attempts
@@ -96,7 +107,7 @@ func (m *Manager) Send(agentID string, command string, params any) error {
 
 	var lastErr error
 
-	// Ensure agent is unregistered if all attempts fail
+	// Ensure session is unregistered if all attempts fail
 	defer func() {
 		if lastErr != nil {
 			slog.Warn("Unregistering after failed retries",
@@ -125,11 +136,13 @@ func (m *Manager) Send(agentID string, command string, params any) error {
 	return fmt.Errorf("failed to send command %q to agent %q after %d attempts: %w", command, agentID, maxRetries, lastErr)
 }
 
-// attemptSend attempts to send a command with data to the specified agent.
+// attemptSend tries to deliver a command with parameters to the specified
+// agent. Returns an error if the agent is not connected or if the message
+// cannot be sent.
 func (m *Manager) attemptSend(agentID string, command string, params any) error {
-	// Acquire a read lock to safely access the agent map
+	// Acquire a read lock to safely access the session map
 	m.mu.RLock()
-	agent, exists := m.agents[agentID]
+	session, exists := m.sessions[agentID]
 	m.mu.RUnlock()
 
 	if !exists {
@@ -150,89 +163,102 @@ func (m *Manager) attemptSend(agentID string, command string, params any) error 
 
 	// Safely write to the client's ResponseWriter.
 	select {
-	case <-agent.done:
+	case <-session.done:
 		// Agent connection is closed
 		return fmt.Errorf("agent %s connection closed", agentID)
 	default:
-		_, err = fmt.Fprintf(agent.writer, "data: %s\n\n", jsonData)
+		_, err = fmt.Fprintf(session.writer, "data: %s\n\n", jsonData)
 		if err != nil {
 			m.Unregister(agentID) // Cleanup if writing fails.
 			return fmt.Errorf("failed to send command to agent %s: %w", agentID, err)
 		}
 
 		// Ensure data is flushed to the client immediately
-		if flusher, ok := agent.writer.(http.Flusher); ok {
+		if flusher, ok := session.writer.(http.Flusher); ok {
 			flusher.Flush()
 		} else {
 			slog.Warn("Flushing not supported", "agentID", agentID)
 		}
 	}
 
-	slog.Info("Command sent to agent",
-		"agentID", agentID, "command", command)
+	slog.Info("Command sent",
+		"agentID", agentID,
+		"requestID", msg.RequestID,
+		"command", command,
+		"params", msg.Params)
+
 	return nil
 }
 
-// Cleanup removes inactive agents from the manager.
+// Cleanup removes inactive agent sessions that have exceeded the cleanup
+// threshold. Sessions are considered inactive if they have not received
+// a heartbeat within the threshold period.
 func (m *Manager) Cleanup() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	now := time.Now()
-	for agentID, agent := range m.agents {
+	for agentID, session := range m.sessions {
 		select {
-		case <-agent.done:
+		case <-session.done:
 			// Remove disconnected clients.
-			delete(m.agents, agentID)
+			delete(m.sessions, agentID)
 			slog.Info("Cleaned up inactive agent",
 				"agentID", agentID)
 		default:
-			// Remove inactive agents
-			if now.Sub(agent.lastHeartbeat) > m.cleanupThreshold {
-				close(agent.done)
-				delete(m.agents, agentID)
-				slog.Info("Agent removed due to inactivity",
-					"agentID", agentID)
+			// Remove inactive sessions
+			if now.Sub(session.lastHeartbeat) > m.cleanupThreshold {
+				slog.Info("Agent marked for removal due to inactivity", "agentID", agentID)
+				m.Unregister(agentID)
 			}
 		}
 	}
 }
 
-// Count returns the number of connected agents.
+// Count returns the total number of active agent sessions.
 func (m *Manager) Count() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return len(m.agents)
+	return len(m.sessions)
 }
 
-// Example token validation function
+// validateToken checks whether the provided token matches the expected
+// authentication token. Returns true if the token is valid, otherwise
+// returns false.
 func (m *Manager) validateToken(token string) bool {
 	return token == m.token
 }
 
-// EventsHandler creates an HTTP handler for managing a Server-Sent Events
-// (SSE) connection. It registers the client with the given Manager
-// and handles cleanup when the connection is closed.
-func (m *Manager) EventsHandler(w http.ResponseWriter, r *http.Request) {
+// validateRequestToken extracts and validates the authentication token from
+// the request. Returns an error if the token is missing or invalid.
+func (m *Manager) validateRequestToken(r *http.Request) error {
 	token := r.Header.Get("Authorization")
 	if token == "" || !strings.HasPrefix(token, "Bearer ") {
 		slog.Error("missing token")
-		http.Error(w, "Unauthorized: Missing token",
-			http.StatusUnauthorized)
-		return
+		return fmt.Errorf("unauthorized: missing token")
 	}
 
-	// Extract and validate the token
 	providedToken := strings.TrimPrefix(token, "Bearer ")
 	if !m.validateToken(providedToken) {
 		slog.Error("invalid token")
-		http.Error(w, "Unauthorized: Invalid token",
-			http.StatusUnauthorized)
+		return fmt.Errorf("unauthorized: invalid token")
+	}
+
+	return nil
+}
+
+// EventsHandler manages a Server-Sent Events (SSE) connection for an agent.
+// It authenticates the request, registers the agent, and ensures proper
+// cleanup when the connection closes.
+func (m *Manager) EventsHandler(w http.ResponseWriter, r *http.Request) {
+	if err := m.validateRequestToken(r); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
 
 	agentID := r.URL.Query().Get("agentID")
 	if agentID == "" {
+		slog.Warn("Agent ID missing in request", "remoteAddr", r.RemoteAddr, "headers", r.Header)
 		http.Error(w, "Agent ID missing", http.StatusBadRequest)
 		return
 	}
@@ -242,18 +268,15 @@ func (m *Manager) EventsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// Register the client and ensure cleanup on exit
 	m.Register(agentID, w)
 	defer m.Unregister(agentID)
 
-	// Check if the ResponseWriter supports CloseNotifier
 	closeNotifier, ok := w.(http.CloseNotifier)
 	if !ok {
 		http.Error(w, "Server does not support close notifications", http.StatusInternalServerError)
 		return
 	}
 
-	// Monitor for disconnection or cancellation
 	select {
 	case <-r.Context().Done():
 		slog.Info("Request context canceled",
@@ -267,40 +290,34 @@ func (m *Manager) EventsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// GetAgentDoneChannel returns the `done` channel of the specified agent,
-// which signals when the agent's connection is closed. If the agent does
-// not exist, it returns a closed channel to prevent blocking.
+// GetAgentDoneChannel returns a read-only channel that signals when the
+// specified agent's session is closed. If the agent does not exist, it
+// returns a closed channel to prevent blocking.
 func (m *Manager) GetAgentDoneChannel(agentID string) <-chan struct{} {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if agent, exists := m.agents[agentID]; exists {
-		return agent.done
+	if session, exists := m.sessions[agentID]; exists {
+		return session.done
 	}
 
 	// Return a closed channel if agent doesn't exist to prevent blocking
 	return closedCh
 }
 
+// closedCh is a pre-closed channel used as a fallback when an agent session
+// does not exist. This prevents goroutines from blocking on reads from a
+// missing session's done channel.
 var closedCh = func() chan struct{} {
 	ch := make(chan struct{})
 	close(ch)
 	return ch
 }()
 
-/*
-// closedChannel creates and returns a closed channel of type `chan struct{}`.
-func closedChannel() <-chan struct{} {
-	ch := make(chan struct{})
-	close(ch)
-	return ch
-}
-*/
-
-// CleanupRoutine periodically calls the Cleanup method on the provided
-// Manager to remove inactive agents. It runs at the specified interval
-// until the context is canceled.
-func (m *Manager) CleanupRoutine(interval time.Duration, ctx context.Context) {
+// CleanupRoutine periodically invokes the Cleanup method to remove inactive
+// agent sessions. It runs at the specified interval until the provided
+// context is canceled.
+func (m *Manager) CleanupRoutine(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		slog.Warn("Invalid cleanup interval, skipping routine")
 		return
@@ -323,7 +340,9 @@ func (m *Manager) CleanupRoutine(interval time.Duration, ctx context.Context) {
 	}
 }
 
-// HeartbeatHandler handles periodic heartbeat signals from agents.
+// HeartbeatHandler processes heartbeat signals from agents to indicate
+// active connections. It updates the last heartbeat timestamp for the
+// specified agent or returns an error if the agent is not connected.
 func (m *Manager) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	agentID := r.URL.Query().Get("agentID")
 	if agentID == "" {
@@ -334,8 +353,8 @@ func (m *Manager) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if agent, exists := m.agents[agentID]; exists {
-		agent.lastHeartbeat = time.Now()
+	if session, exists := m.sessions[agentID]; exists {
+		session.lastHeartbeat = time.Now()
 		slog.Info("Heartbeat received", "agentID", agentID)
 		w.WriteHeader(http.StatusOK)
 	} else {
@@ -344,11 +363,12 @@ func (m *Manager) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 
 }
 
-// Get retrieves an agent by ID.
-func (m *Manager) Get(agentID string) (*agent, bool) {
+// Get returns the session associated with the specified agent ID. The second
+// return value indicates whether the session exists.
+func (m *Manager) Get(agentID string) (*session, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	agent, exists := m.agents[agentID]
-	return agent, exists
+	session, exists := m.sessions[agentID]
+	return session, exists
 }
