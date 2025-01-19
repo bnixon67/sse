@@ -61,14 +61,16 @@ type agent struct {
 	Client            *http.Client      // HTTP client for requests.
 }
 
-// NewAgent creates a new Agent instance with the specified ID, token,
-// and server URL. A map of command handlers must be provided to define
-// how different commands are processed. Additional configuration options
-// can be applied using functional options (AgentOption).
+// NewAgent creates a new Agent instance with the specified ID, token, and
+// server URL. It uses the provided command handler map to dispatch commands
+// to their respective functions. Additional configuration options can be
+// applied using functional options (AgentOption).
 //
-// If nil is provided for handlers, an empty CommandHandlerMap is used.
-// If no functional options are provided, the agent is initialized with
-// default settings for heartbeat and retry intervals.
+// If nil is provided for handlers, an empty CmdHandlerFuncMap is used.
+//
+// If no functional options are provided, the agent is initialized with default
+// settings, including [DefaultHeartbeatInterval], [DefaultRetryInterval],
+// and a default HTTP client.
 func NewAgent(id, token, serverURL string, handlers CmdHandlerFuncMap, opts ...AgentOption) Agent {
 	if handlers == nil {
 		handlers = make(CmdHandlerFuncMap)
@@ -82,7 +84,7 @@ func NewAgent(id, token, serverURL string, handlers CmdHandlerFuncMap, opts ...A
 		HeartbeatInterval: DefaultHeartbeatInterval,
 		RetryInterval:     DefaultRetryInterval,
 		Client:            &http.Client{},
-		// Don't set Client Timeout connectioni should stay open.
+		// Don't set Client Timeout connection should stay open.
 	}
 
 	for _, opt := range opts {
@@ -93,34 +95,41 @@ func NewAgent(id, token, serverURL string, handlers CmdHandlerFuncMap, opts ...A
 }
 
 // WithHeartbeatInterval sets the heartbeat interval for an Agent.
-// If the provided interval is zero or negative, the default heartbeat
-// interval (DefaultHeartbeatInterval) is used.
+//
+// If the provided interval is zero or negative, the existing heartbeat
+// interval remains unchanged.
 func WithHeartbeatInterval(interval time.Duration) AgentOption {
 	return func(a *agent) {
-		if interval > 0 {
-			a.HeartbeatInterval = interval
+		if interval <= 0 {
+			return
 		}
+		a.HeartbeatInterval = interval
 	}
 }
 
-// WithRetryInterval sets the reconnection retry interval for an Agent.
-// If the provided interval is zero or negative, the default retry
-// interval (DefaultRetryInterval) is used.
+// WithRetryInterval sets the retry interval for an Agent.
+//
+// If the provided interval is zero or negative, the existing retry interval
+// remains unchanged.
 func WithRetryInterval(interval time.Duration) AgentOption {
 	return func(a *agent) {
-		if interval > 0 {
-			a.RetryInterval = interval
+		if interval <= 0 {
+			return
 		}
+		a.RetryInterval = interval
 	}
 }
 
 // WithClient sets the HTTP client for an Agent.
-// If nil is provided, a default HTTP client with a standard timeout is used.
+//
+// If nil is provided, the existing client remains unchanged.
 func WithClient(client *http.Client) AgentOption {
 	return func(a *agent) {
-		if client != nil {
-			a.Client = client
+		if client == nil {
+			return
 		}
+
+		a.Client = client
 	}
 }
 
@@ -154,7 +163,7 @@ func (a *agent) ConnectAndReceiveRetry(ctx context.Context) {
 func buildURL(baseURL, path, agentID string) (string, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
-		return "", fmt.Errorf("invalid server URL: %w", err)
+		return "", fmt.Errorf("invalid base URL: %w", err)
 	}
 	u.Path, err = url.JoinPath(u.Path, path)
 	if err != nil {
@@ -216,8 +225,8 @@ func (a *agent) ConnectAndReceive(ctx context.Context) error {
 	return nil
 }
 
-// SendHeartbeat notifies the server that the agent is active.
-// Returns an error if the request fails.
+// SendHeartbeat notifies the server that the agent is active. Returns an
+// error if the request fails.
 func (a *agent) SendHeartbeat() error {
 	u, err := buildURL(a.ServerURL, "/heartbeat", a.ID)
 	if err != nil {
@@ -267,9 +276,8 @@ func (a *agent) startHeartbeat(ctx context.Context) {
 	}
 }
 
-// validateMessage checks whether a Message is valid.
-// It returns an error if the message is missing a command
-// or has an invalid parameter format.
+// validateMessage checks whether a Message is valid. It returns an error
+// if the message is missing a command or has an invalid parameter format.
 func validateMessage(m Message) error {
 	if m.Command == "" {
 		return fmt.Errorf("missing command name")
@@ -304,6 +312,7 @@ func (a *agent) processServerEvent(eventLine string) error {
 		return fmt.Errorf("invalid message: %w", err)
 	}
 
+	// Dispatch command to function.
 	if fn, exists := a.Handlers[msg.Command]; exists {
 		fn(msg.Params)
 	} else {
