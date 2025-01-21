@@ -6,25 +6,63 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
 
-// CommandHandlerFunc defines a func type that processes a command's payload.
+// DefaultRetryInterval defines how long an agent waits before attempting
+// to reconnect after a connection failure.
+const DefaultRetryInterval = 30 * time.Second
+
+// DefaultIdleConnTimeout defines how long an idle connection remains open
+// before being closed. It should be greater than DefaultHeartbeatInterval
+// to prevent the connection from being closed due to inactivity.
+const DefaultIdleConnTimeout = 5 * time.Minute
+
+// DefaultHeartbeatInterval defines the interval at which heartbeat messages
+// should be sent to keep the connection alive. It should be less than
+// DefaultIdleConnTimeout to prevent the connection from being closed due
+// to inactivity.
+const DefaultHeartbeatInterval = 1 * time.Minute
+
+// DefaultExpectContinueTimeout controls how long the client waits for an
+// HTTP/1.1 "100 Continue" response. Since SSE connections are long-lived,
+// this should be short to avoid unnecessary delays.
+const DefaultExpectContinueTimeout = 1 * time.Second
+
+// DefaultResponseHeaderTimeout defines how long to wait for a server's
+// response headers. Should generally be unset (0) for SSE to avoid
+// premature timeouts.
+const DefaultResponseHeaderTimeout = 0
+
+// DefaultDialerTimeout defines the maximum amount of time a dial will wait
+// for a connection.
+const DefaultDialerTimeout = 10 * time.Second
+
+// DefaultHTTPClient is the default HTTP client for an Agent.
+//
+// It sets an idle connection timeout but omits a client timeout,
+// ensuring connections remain open indefinitely. This is essential
+// for Server-Sent Events (SSE) and other long-lived connections.
+var DefaultHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		IdleConnTimeout:       DefaultIdleConnTimeout,
+		ExpectContinueTimeout: DefaultExpectContinueTimeout,
+		ResponseHeaderTimeout: DefaultResponseHeaderTimeout,
+		DialContext: (&net.Dialer{
+			Timeout: DefaultDialerTimeout,
+		}).DialContext,
+	},
+}
+
+// CommandHandlerFunc represents a function that processes a command.
 type CommandHandlerFunc func(any)
 
 // CmdHandlerFuncMap maps command names to respective handler functions.
 type CmdHandlerFuncMap map[string]CommandHandlerFunc
-
-// DefaultHeartbeatInterval is the standard time interval for an agent
-// to send heartbeat signals to the server, indicating it is still active.
-const DefaultHeartbeatInterval = 1 * time.Minute
-
-// DefaultRetryInterval defines the default duration an agent waits
-// before attempting to reconnect after a connection failure.
-const DefaultRetryInterval = 30 * time.Second
 
 // AgentOption represents a functional option for configuring an Agent instance.
 type AgentOption func(*Agent)
@@ -43,13 +81,6 @@ type Agent struct {
 	// Function hooks for customization
 	ConnectAndReceiveFn func(ctx context.Context) error
 	SendHeartbeatFn     func() error
-}
-
-var DefaultHTTPClient = &http.Client{
-	Transport: &http.Transport{
-		IdleConnTimeout: 90 * time.Second,
-	},
-	// Don't set Client Timeout connection should stay open.
 }
 
 // NewAgent creates a new Agent instance with the specified ID, token, and
@@ -126,7 +157,9 @@ func WithClient(client *http.Client) AgentOption {
 	}
 }
 
-// WithCustomConnectAndReceive allows a custom [ConnectAndReceive] function
+// WithCustomConnectAndReceive sets a custom ConnectAndReceive function.
+//
+// If nil is provided, the existing function remains unchanged.
 func WithCustomConnectAndReceive(fn func(ctx context.Context) error) AgentOption {
 	return func(a *Agent) {
 		if fn == nil {
@@ -136,7 +169,9 @@ func WithCustomConnectAndReceive(fn func(ctx context.Context) error) AgentOption
 	}
 }
 
-// WithCustomSendHeartbeat allows a custom [SendHeartbeat] function
+// WithCustomSendHeartbeat sets a custom SendHeartbeat function
+//
+// If nil is provided, the existing function remains unchanged.
 func WithCustomSendHeartbeat(fn func() error) AgentOption {
 	return func(a *Agent) {
 		if fn == nil {
@@ -183,28 +218,32 @@ func buildURL(baseURL, path, agentID string) (string, error) {
 		return "", fmt.Errorf("failed to join path: %w", err)
 	}
 
-	query := u.Query()
-	query.Set("agentID", agentID)
-	u.RawQuery = query.Encode()
+	q := u.Query()
+	q.Set("agentID", agentID)
+	u.RawQuery = q.Encode()
 
 	return u.String(), nil
 }
 
-// sendRequest sends an HTTP request to the given endpoint using the agent's
-// configuration. It sets the Authorization header and returns the HTTP
-// response.
+// sendRequest sends an HTTP request to the specified endpoint using the
+// agent's configuration.
+//
+// It constructs the request URL based on the agent’s server URL and ID,
+// sets the Authorization header with the agent's bearer token, and executes
+// the request using the configured HTTP client.
 //
 // The caller is responsible for closing the response body.
 //
-// An error is returned if the request fails or the server returns a non-200
-// status.
+// If the request fails or the server responds with a non-200 status, an
+// error is returned, and the response body is closed internally. On success,
+// the caller is responsible for closing the response body.
 func (a *Agent) sendRequest(ctx context.Context, method, endpoint string) (*http.Response, error) {
 	u, err := buildURL(a.ServerURL, endpoint, a.ID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create URL: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, u, nil)
+	req, err := http.NewRequestWithContext(ctx, method, u, http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -236,7 +275,7 @@ func (a *Agent) ConnectAndReceive(ctx context.Context) error {
 
 	slog.Info("Connected to server", "agentID", a.ID)
 
-	go a.startHeartbeat(ctx)
+	go a.StartHeartbeat(ctx)
 
 	// Process server-sent events
 	scanner := bufio.NewScanner(resp.Body)
@@ -268,20 +307,20 @@ func (a *Agent) SendHeartbeat() error {
 	return nil
 }
 
-// startHeartbeat periodically sends heartbeat signals to the server at the
-// configured interval until the provided context is canceled.
-func (a *Agent) startHeartbeat(ctx context.Context) {
+// StartHeartbeat periodically sends a heartbeat request to the server at the
+// configured HeartbeatInterval. It runs until the provided context is canceled.
+func (a *Agent) StartHeartbeat(ctx context.Context) {
+	if a.SendHeartbeatFn == nil {
+		slog.Warn("SKipping heartbeat, SendHeartbeatFn is nil",
+			"agentID", a.ID)
+		return
+	}
+
 	slog.Info("Heartbeat started", "agentID", a.ID)
 
 	heartbeatInterval := a.HeartbeatInterval
 	if heartbeatInterval <= 0 {
 		heartbeatInterval = DefaultHeartbeatInterval
-	}
-
-	if a.SendHeartbeatFn == nil {
-		slog.Error("SendHeartbeatFn is nil, skipping heartbeat",
-			"agentID", a.ID)
-		return
 	}
 
 	ticker := time.NewTicker(heartbeatInterval)
@@ -319,15 +358,15 @@ func validateMessage(m Message) error {
 // processServerEvent routes an incoming server event to the appropriate
 // handler.
 //
-// Note: Multi-line `data` fields are not currently supported.
+// Note: Multi-line `data` fields are not supported.
 func (a *Agent) processServerEvent(eventLine string) error {
-	const dataPrefix = "data: "
-	if !strings.HasPrefix(eventLine, dataPrefix) {
+	const prefix = "data: "
+	if !strings.HasPrefix(eventLine, prefix) {
 		return nil // Ignore lines that don't start with "data: "
 	}
 
-	// Extract the eventData after "data: "
-	eventData := eventLine[len(dataPrefix):]
+	// Extract the eventData
+	eventData := eventLine[len(prefix):]
 
 	var msg Message
 	if err := json.Unmarshal([]byte(eventData), &msg); err != nil {

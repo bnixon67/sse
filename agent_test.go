@@ -578,7 +578,7 @@ func TestStartHeartbeat(t *testing.T) {
 				SendHeartbeatFn:   heartbeatFunc,
 			}
 
-			go agent.startHeartbeat(ctx)
+			go agent.StartHeartbeat(ctx)
 			time.Sleep(300 * time.Millisecond)
 
 			if atomic.LoadInt32(&runCount) < int32(tc.wantMinRuns) {
