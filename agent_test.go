@@ -339,10 +339,8 @@ func TestConnectAndReceive(t *testing.T) {
 			}
 
 			gotExecutions := 0
-			agent := &Agent{
-				ServerURL: tc.serverURL,
-				Client:    &http.Client{},
-				Handlers: CmdHandlerFuncMap{
+			agent := NewAgent("id", "token", tc.serverURL,
+				CmdHandlerFuncMap{
 					"TestCommand": func(params any) {
 						gotExecutions++
 
@@ -365,7 +363,7 @@ func TestConnectAndReceive(t *testing.T) {
 						}
 					},
 				},
-			}
+			)
 			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 			defer cancel()
 
@@ -444,14 +442,13 @@ func TestConnectAndReceiveRetry(t *testing.T) {
 			defer cancel()
 
 			retryCount := -1
-			agent := &Agent{
-				ID:            "test-agent",
-				RetryInterval: retryInterval,
-				ConnectAndReceiveFn: func(ctx context.Context) error {
+			agent := NewAgent("id", "token", "url", nil,
+				WithCustomConnectAndReceive(func(ctx context.Context) error {
 					retryCount++
 					return tc.connectFn(ctx)
-				},
-			}
+				}),
+				WithRetryInterval(retryInterval),
+			)
 
 			agent.ConnectAndReceiveRetry(ctx)
 
@@ -524,12 +521,9 @@ func TestSendHeartbeat(t *testing.T) {
 				client = &http.Client{}
 			}
 
-			agent := &Agent{
-				ID:        "test-agent",
-				Token:     "test-token",
-				ServerURL: serverURL,
-				Client:    client,
-			}
+			agent := NewAgent("id", "test-token", serverURL, nil,
+				WithClient(client),
+			)
 
 			err := agent.SendHeartbeat()
 			if (err != nil) != tc.wantErr {
@@ -572,11 +566,10 @@ func TestStartHeartbeat(t *testing.T) {
 				return nil
 			}
 
-			agent := &Agent{
-				ID:                "test-agent",
-				HeartbeatInterval: 50 * time.Millisecond,
-				SendHeartbeatFn:   heartbeatFunc,
-			}
+			agent := NewAgent("id", "token", "url", nil,
+				WithHeartbeatInterval(50*time.Millisecond),
+				WithCustomSendHeartbeat(heartbeatFunc),
+			)
 
 			go agent.StartHeartbeat(ctx)
 			time.Sleep(300 * time.Millisecond)
@@ -664,11 +657,11 @@ func TestProcessServerEvent(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var gotParams any
-			agent := &Agent{
-				Handlers: map[string]CommandHandlerFunc{
+			agent := NewAgent("id", "token", "url",
+				map[string]CommandHandlerFunc{
 					"TestCommand": func(params any) { gotParams = params },
 				},
-			}
+			)
 
 			err := agent.processServerEvent(tc.eventLine)
 			if (err != nil) != tc.wantErr {
@@ -755,11 +748,7 @@ func TestSendRequest(t *testing.T) {
 			defer server.Close()
 
 			// Create agent with mock client
-			agent := &Agent{
-				ID:        "test-agent",
-				Token:     "test-token",
-				ServerURL: server.URL,
-			}
+			agent := NewAgent("id", "test-token", server.URL, nil)
 
 			// Use a mock client if needed
 			if tt.mockError != nil {
