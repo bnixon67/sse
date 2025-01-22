@@ -77,6 +77,7 @@ type Agent struct {
 	HeartbeatInterval time.Duration     // Interval for hearbeat signals.
 	RetryInterval     time.Duration     // Interval for reconnect attempts.
 	Client            *http.Client      // HTTP client for requests.
+	Logger            *slog.Logger      // Custom logger
 
 	// Function hooks for customization
 	ConnectAndReceiveFn func(ctx context.Context) error
@@ -106,6 +107,7 @@ func NewAgent(id, token, serverURL string, handlers CmdHandlerFuncMap, opts ...A
 		HeartbeatInterval: DefaultHeartbeatInterval,
 		RetryInterval:     DefaultRetryInterval,
 		Client:            DefaultHTTPClient,
+		Logger:            slog.Default(),
 	}
 
 	// Set default function implementations
@@ -181,6 +183,18 @@ func WithCustomSendHeartbeat(fn func() error) AgentOption {
 	}
 }
 
+// WithLogger allows setting a custom logger for the Agent.
+//
+// If nil is provided, the default logger will be used.
+func WithLogger(logger *slog.Logger) AgentOption {
+	return func(a *Agent) {
+		if logger == nil {
+			a.Logger = slog.Default()
+		}
+		a.Logger = logger
+	}
+}
+
 // ConnectAndReceiveRetry establishes a connection to the server and listens
 // for events. If the connection is lost, it automatically attempts to
 // reconnect. The function runs until the provided context is canceled.
@@ -192,16 +206,17 @@ func (a *Agent) ConnectAndReceiveRetry(ctx context.Context) {
 
 	for {
 		if err := a.ConnectAndReceiveFn(ctx); err != nil {
-			slog.Error("Connection error",
+			a.Logger.Error("Connection error",
 				"agentID", a.ID, "error", err)
 		}
 
 		select {
 		case <-ctx.Done():
-			slog.Info("Shutting down event loop", "agentID", a.ID)
+			a.Logger.Info("Shutting down event loop",
+				"agentID", a.ID)
 			return
 		case <-time.After(retryInterval):
-			slog.Info("Retrying connection",
+			a.Logger.Info("Retrying connection",
 				"agentID", a.ID, "retryInterval", retryInterval)
 		}
 	}
@@ -273,7 +288,7 @@ func (a *Agent) ConnectAndReceive(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	slog.Info("Connected to server", "agentID", a.ID)
+	a.Logger.Info("Connected to server", "agentID", a.ID)
 
 	go a.StartHeartbeat(ctx)
 
@@ -282,7 +297,7 @@ func (a *Agent) ConnectAndReceive(ctx context.Context) error {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if err := a.processServerEvent(line); err != nil {
-			slog.Error("Failed to process server event",
+			a.Logger.Error("Failed to process server event",
 				"error", err, "line", line)
 		}
 	}
@@ -290,7 +305,7 @@ func (a *Agent) ConnectAndReceive(ctx context.Context) error {
 		return fmt.Errorf("error reading from server: %w", err)
 	}
 
-	slog.Info("Disconnected from server", "agentID", a.ID)
+	a.Logger.Info("Disconnected from server", "agentID", a.ID)
 
 	return nil
 }
@@ -311,12 +326,12 @@ func (a *Agent) SendHeartbeat() error {
 // configured HeartbeatInterval. It runs until the provided context is canceled.
 func (a *Agent) StartHeartbeat(ctx context.Context) {
 	if a.SendHeartbeatFn == nil {
-		slog.Warn("SKipping heartbeat, SendHeartbeatFn is nil",
+		a.Logger.Warn("SKipping heartbeat, SendHeartbeatFn is nil",
 			"agentID", a.ID)
 		return
 	}
 
-	slog.Info("Heartbeat started", "agentID", a.ID)
+	a.Logger.Info("Heartbeat started", "agentID", a.ID)
 
 	heartbeatInterval := a.HeartbeatInterval
 	if heartbeatInterval <= 0 {
@@ -329,12 +344,12 @@ func (a *Agent) StartHeartbeat(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("Heartbeat stopped", "agentID", a.ID)
+			a.Logger.Info("Heartbeat stopped", "agentID", a.ID)
 			return
 		case <-ticker.C:
-			slog.Debug("Sending heartbeat", "agentID", a.ID)
+			a.Logger.Debug("Sending heartbeat", "agentID", a.ID)
 			if err := a.SendHeartbeatFn(); err != nil {
-				slog.Error("Failed to send heartbeat",
+				a.Logger.Error("Failed to send heartbeat",
 					"agentID", a.ID, "error", err)
 			}
 		}
@@ -381,7 +396,7 @@ func (a *Agent) processServerEvent(eventLine string) error {
 	if fn, exists := a.Handlers[msg.Command]; exists {
 		fn(msg.Params)
 	} else {
-		slog.Warn("Unknown command", "name", msg.Command)
+		a.Logger.Warn("Unknown command", "name", msg.Command)
 	}
 
 	return nil
