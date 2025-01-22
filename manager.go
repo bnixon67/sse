@@ -15,7 +15,7 @@ import (
 type Message struct {
 	RequestID string // Unique identifier for the request.
 	Command   string // Name of the command to execute.
-	Params    any    // Optional parameters for the command.
+	Params    any    // Parameters for the command.
 }
 
 // session maintains an agent's connection details.
