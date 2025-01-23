@@ -13,13 +13,13 @@ import (
 
 // Message represents a command sent from the server to an agent.
 type Message struct {
-	RequestID string // Unique identifier for the request.
-	Command   string // Name of the command to execute.
-	Params    any    // Parameters for the command.
+	ID      string // Unique identifier for the message
+	Command string // Name of the command
+	Params  any    // Parameters for the command
 }
 
-// session maintains an agent's connection details.
-type session struct {
+// Session maintains an agent's connection details.
+type Session struct {
 	writer        http.ResponseWriter
 	done          chan struct{}
 	lastHeartbeat time.Time
@@ -31,17 +31,11 @@ const DefaultCleanupThreshold = 5 * time.Minute
 
 // Manager handles the lifecycle of agent sessions.
 type Manager struct {
-	// Ensures thread-safe access to sessions.
-	mu sync.RWMutex
-
-	// Active agent sessions indexed by agent ID.
-	sessions map[string]*session
-
-	// Duration before an inactive session is removed.
-	cleanupThreshold time.Duration
-
-	// Authentication token for agent validation.
-	token string
+	mu               sync.RWMutex        // Ensures thread-safe access
+	sessions         map[string]*Session // Active sessions indexed by ID
+	cleanupThreshold time.Duration       // Inactive session removal
+	token            string              // Token for agent validation
+	logger           *slog.Logger        // Custom logger
 }
 
 // NewManager creates a new Manager instance with the specified cleanup
@@ -52,9 +46,10 @@ func NewManager(d time.Duration, token string) *Manager {
 	}
 
 	return &Manager{
-		sessions:         make(map[string]*session),
+		sessions:         make(map[string]*Session),
 		cleanupThreshold: d,
 		token:            token,
+		logger:           slog.Default(),
 	}
 }
 
@@ -69,16 +64,16 @@ func (m *Manager) Register(agentID string, w http.ResponseWriter) {
 	if oldAgent, exists := m.sessions[agentID]; exists {
 		close(oldAgent.done)
 		delete(m.sessions, agentID)
-		slog.Info("Agent disconnected", "agentID", agentID)
+		m.logger.Info("Agent disconnected", "agentID", agentID)
 	}
 
-	m.sessions[agentID] = &session{
+	m.sessions[agentID] = &Session{
 		writer:        w,
 		done:          make(chan struct{}),
 		lastHeartbeat: time.Now(),
 	}
 
-	slog.Info("Agent connected", "agentID", agentID)
+	m.logger.Info("Agent connected", "agentID", agentID)
 }
 
 // Unregister removes the session for the specified agent ID.
@@ -90,9 +85,9 @@ func (m *Manager) Unregister(agentID string) {
 	if session, exists := m.sessions[agentID]; exists {
 		close(session.done)
 		delete(m.sessions, agentID)
-		slog.Info("Agent disconnected", "agentID", agentID)
+		m.logger.Info("Agent disconnected", "agentID", agentID)
 	} else {
-		slog.Warn("Agent does not exist", "agentID", agentID)
+		m.logger.Warn("Agent does not exist", "agentID", agentID)
 	}
 }
 
@@ -110,7 +105,7 @@ func (m *Manager) Send(agentID string, command string, params any) error {
 	// Ensure session is unregistered if all attempts fail
 	defer func() {
 		if lastErr != nil {
-			slog.Warn("Unregistering after failed retries",
+			m.logger.Warn("Unregistering after failed retries",
 				"agentID", agentID)
 			m.Unregister(agentID)
 		}
@@ -151,9 +146,9 @@ func (m *Manager) attemptSend(agentID string, command string, params any) error 
 
 	// Prepare the command message
 	msg := Message{
-		RequestID: fmt.Sprintf("%d", time.Now().UnixNano()),
-		Command:   command,
-		Params:    params,
+		ID:      fmt.Sprintf("%d", time.Now().UnixNano()),
+		Command: command,
+		Params:  params,
 	}
 
 	jsonData, err := json.Marshal(msg)
@@ -177,13 +172,13 @@ func (m *Manager) attemptSend(agentID string, command string, params any) error 
 		if flusher, ok := session.writer.(http.Flusher); ok {
 			flusher.Flush()
 		} else {
-			slog.Warn("Flushing not supported", "agentID", agentID)
+			m.logger.Warn("Flushing not supported", "agentID", agentID)
 		}
 	}
 
-	slog.Info("Command sent",
+	m.logger.Info("Command sent",
 		"agentID", agentID,
-		"requestID", msg.RequestID,
+		"requestID", msg.ID,
 		"command", command,
 		"params", msg.Params)
 
@@ -203,12 +198,12 @@ func (m *Manager) Cleanup() {
 		case <-session.done:
 			// Remove disconnected clients.
 			delete(m.sessions, agentID)
-			slog.Info("Cleaned up inactive agent",
+			m.logger.Info("Cleaned up inactive agent",
 				"agentID", agentID)
 		default:
 			// Remove inactive sessions
 			if now.Sub(session.lastHeartbeat) > m.cleanupThreshold {
-				slog.Info("Agent marked for removal due to inactivity", "agentID", agentID)
+				m.logger.Info("Agent marked for removal due to inactivity", "agentID", agentID)
 				m.Unregister(agentID)
 			}
 		}
@@ -234,13 +229,13 @@ func (m *Manager) validateToken(token string) bool {
 func (m *Manager) validateRequestToken(r *http.Request) error {
 	token := r.Header.Get("Authorization")
 	if token == "" || !strings.HasPrefix(token, "Bearer ") {
-		slog.Error("missing token")
+		m.logger.Error("missing token")
 		return fmt.Errorf("unauthorized: missing token")
 	}
 
 	providedToken := strings.TrimPrefix(token, "Bearer ")
 	if !m.validateToken(providedToken) {
-		slog.Error("invalid token")
+		m.logger.Error("invalid token")
 		return fmt.Errorf("unauthorized: invalid token")
 	}
 
@@ -258,7 +253,7 @@ func (m *Manager) EventsHandler(w http.ResponseWriter, r *http.Request) {
 
 	agentID := r.URL.Query().Get("agentID")
 	if agentID == "" {
-		slog.Warn("Agent ID missing in request", "remoteAddr", r.RemoteAddr, "headers", r.Header)
+		m.logger.Warn("Agent ID missing in request", "remoteAddr", r.RemoteAddr, "headers", r.Header)
 		http.Error(w, "Agent ID missing", http.StatusBadRequest)
 		return
 	}
@@ -279,13 +274,13 @@ func (m *Manager) EventsHandler(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case <-r.Context().Done():
-		slog.Info("Request context canceled",
+		m.logger.Info("Request context canceled",
 			"agentID", agentID)
 	case <-closeNotifier.CloseNotify():
-		slog.Info("Connection closed by client",
+		m.logger.Info("Connection closed by client",
 			"agentID", agentID)
 	case <-m.GetAgentDoneChannel(agentID):
-		slog.Info("Connection closed by server",
+		m.logger.Info("Connection closed by server",
 			"agentID", agentID)
 	}
 }
@@ -319,22 +314,22 @@ var closedCh = func() chan struct{} {
 // context is canceled.
 func (m *Manager) CleanupRoutine(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
-		slog.Warn("Invalid cleanup interval, skipping routine")
+		m.logger.Warn("Invalid cleanup interval, skipping routine")
 		return
 	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	slog.Info("Starting cleanup routine", "interval", interval)
+	m.logger.Info("Starting cleanup routine", "interval", interval)
 
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("Cleanup routine shutting down")
+			m.logger.Info("Cleanup routine shutting down")
 			return
 		case <-ticker.C:
-			slog.Info("Running cleanup")
+			m.logger.Info("Running cleanup")
 			m.Cleanup()
 		}
 	}
@@ -355,7 +350,7 @@ func (m *Manager) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 
 	if session, exists := m.sessions[agentID]; exists {
 		session.lastHeartbeat = time.Now()
-		slog.Info("Heartbeat received", "agentID", agentID)
+		m.logger.Info("Heartbeat received", "agentID", agentID)
 		w.WriteHeader(http.StatusOK)
 	} else {
 		http.Error(w, "Agent not connected", http.StatusNotFound)
@@ -365,7 +360,7 @@ func (m *Manager) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 
 // Get returns the session associated with the specified agent ID. The second
 // return value indicates whether the session exists.
-func (m *Manager) Get(agentID string) (*session, bool) {
+func (m *Manager) Get(agentID string) (*Session, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
